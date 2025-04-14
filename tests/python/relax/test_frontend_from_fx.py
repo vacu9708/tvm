@@ -750,6 +750,43 @@ def test_einsum():
 
 
 @tvm.testing.requires_gpu
+def test_softplus():
+    import torch
+    from torch.nn import Module
+
+    torch.set_grad_enabled(False)
+
+    class Softplus0(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.softplus = torch.nn.Softplus(1.0, 20.0)
+
+        def forward(self, x):
+            return self.softplus(x)
+
+    class Softplus1(Module):
+        def forward(self, input):
+            return torch.nn.functional.softplus(input, 1.0, 20.0)
+
+    @tvm.script.ir_module
+    class expected:
+        @R.function
+        def main(inp_0: R.Tensor((10, 10), dtype="float32")) -> R.Tensor((10, 10), dtype="float32"):
+            # block 0
+            with R.dataflow():
+                lv: R.Tensor((10, 10), dtype="float32") = R.nn.softplus(
+                    inp_0, beta=1.0, threshold=20.0
+                )
+                gv: R.Tensor((10, 10), dtype="float32") = lv
+                R.output(gv)
+            return gv
+
+    input_info = [([10, 10], "float32")]
+    verify_model(Softplus0(), input_info, {}, expected)
+    verify_model(Softplus1(), input_info, {}, expected)
+
+
+@tvm.testing.requires_gpu
 def test_leakyrelu():
     import torch
     from torch.nn import Module
@@ -2225,6 +2262,9 @@ def test_extended_unary_ops():
 
     # leaky_relu
     test_leakyrelu()
+
+    # softplus
+    test_softplus()
 
     # log2
     class Log2(Module):
@@ -4366,6 +4406,111 @@ def test_where():
     verify_model(
         Where(), [([5, 3], "bool"), ([5, 3], "float32"), ([5, 3], "float32")], {}, Expected
     )
+
+
+def test_argsort():
+    class Argsort(Module):
+        def forward(self, x):
+            return torch.argsort(x, dim=1, descending=True)
+
+    @tvm.script.ir_module
+    class Expected:
+        @R.function
+        def main(
+            inp_0: R.Tensor((5, 3), dtype="float32"),
+        ) -> R.Tensor((5, 3), dtype="int32"):
+            with R.dataflow():
+                lv: R.Tensor((5, 3), dtype="int32") = R.argsort(inp_0, axis=1, descending=True)
+                gv: R.Tensor((5, 3), dtype="int32") = lv
+                R.output(gv)
+            return gv
+
+    verify_model(Argsort(), [([5, 3], "float32")], {}, Expected)
+
+
+def test_sort():
+    class Sort(Module):
+        def forward(self, x):
+            return torch.sort(x, dim=1, descending=True)
+
+    @tvm.script.ir_module
+    class Expected:
+        @R.function
+        def main(
+            inp_0: R.Tensor((5, 3), dtype="float32"),
+        ) -> R.Tensor((5, 3), dtype="float32"):
+            with R.dataflow():
+                lv: R.Tensor((5, 3), dtype="float32") = R.sort(inp_0, axis=1, descending=True)
+                gv: R.Tensor((5, 3), dtype="float32") = lv
+                R.output(gv)
+            return gv
+
+    verify_model(Sort(), [([5, 3], "float32")], {}, Expected)
+
+
+def test_topk():
+    class Topk(Module):
+        def forward(self, x):
+            return torch.topk(x, k=2, dim=1, largest=True, sorted=True)
+
+    @tvm.script.ir_module
+    class Expected:
+        @R.function
+        def main(
+            inp_0: R.Tensor((5, 3), dtype="float32"),
+        ) -> R.Tuple(R.Tensor((5, 2), dtype="float32"), R.Tensor((5, 2), dtype="int64")):
+            with R.dataflow():
+                lv: R.Tuple(
+                    R.Tensor((5, 2), dtype="float32"), R.Tensor((5, 2), dtype="int64")
+                ) = R.topk(inp_0, k=2, axis=1, ret_type="both", largest=True, dtype="int64")
+                gv: R.Tuple(R.Tensor((5, 2), dtype="float32"), R.Tensor((5, 2), dtype="int64")) = lv
+                R.output(gv)
+            return gv
+
+    verify_model(Topk(), [([5, 3], "float32")], {}, Expected)
+
+
+def test_broadcast_to():
+    class BroadcastTo(Module):
+        def forward(self, x):
+            return torch.broadcast_to(x, (5, 3))
+
+    @tvm.script.ir_module
+    class Expected:
+        @R.function
+        def main(
+            inp_0: R.Tensor((5, 1), dtype="float32"),
+        ) -> R.Tensor((5, 3), dtype="float32"):
+            with R.dataflow():
+                lv: R.Tensor((5, 3), dtype="float32") = R.broadcast_to(inp_0, (5, 3))
+                gv: R.Tensor((5, 3), dtype="float32") = lv
+                R.output(gv)
+            return gv
+
+    verify_model(BroadcastTo(), [([5, 1], "float32")], {}, Expected)
+
+
+def test_narrow():
+    class Narrow(Module):
+        def forward(self, x):
+            return torch.narrow(x, 1, 0, 2)
+
+    @tvm.script.ir_module
+    class Expected:
+        @R.function
+        def main(
+            inp_0: R.Tensor((5, 3), dtype="float32"),
+        ) -> R.Tensor((5, 2), dtype="float32"):
+            with R.dataflow():
+                lv: R.Tensor((5, 2), dtype="float32") = R.strided_slice(
+                    inp_0, axes=[1], begin=[0], end=[2]
+                )
+                gv: R.Tensor((5, 2), dtype="float32") = lv
+                R.output(gv)
+
+            return gv
+
+    verify_model(Narrow(), [([5, 3], "float32")], {}, Expected)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,13 @@ class TorchFXImporter(BaseFXGraphImporter):
         alpha = module.negative_slope
         return self.block_builder.emit(relax.op.nn.leakyrelu(x, alpha))
 
+    def _softplus_module(self, node: fx.Node) -> relax.Var:
+        x = self.env[node.args[0]]
+        module = self.named_modules[node.target]
+        beta = module.beta
+        threshold = module.threshold
+        return self.block_builder.emit(relax.op.nn.softplus(x, beta, threshold))
+
     def _log2(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
         return self.block_builder.emit(
@@ -415,30 +422,19 @@ class TorchFXImporter(BaseFXGraphImporter):
         dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
         return self.block_builder.emit(relax.op.split(x, chunks, dim))
 
-    def _flatten_impl(self, x, start_dim, end_dim) -> relax.Var:
-        shape = self.shape_of(x)
-        start_dim = start_dim if start_dim >= 0 else len(shape) + start_dim
-        end_dim = end_dim if end_dim >= 0 else len(shape) + end_dim
-        flattened = reduce(lambda x, y: x * y, [shape[i] for i in range(start_dim, end_dim + 1)])
-        new_shape = (
-            [shape[i] for i in range(0, start_dim)]
-            + [flattened]
-            + [shape[i] for i in range(end_dim + 1, len(shape))]
-        )
-        return self.block_builder.emit(relax.op.reshape(x, new_shape))
-
-    def _flatten(self, node: fx.Node) -> relax.Var:
-        x = self.env[node.args[0]]
-        start_dim = node.args[1] if len(node.args) >= 2 else node.kwargs.get("start_dim", 0)
-        end_dim = node.args[2] if len(node.args) == 3 else node.kwargs.get("end_dim", -1)
-        return self._flatten_impl(x, start_dim, end_dim)
-
     def _flatten_module(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
         module = self.named_modules[node.target]
         start_dim = module.start_dim
         end_dim = module.end_dim
         return self._flatten_impl(x, start_dim, end_dim)
+
+    def _narrow(self, node: fx.Node) -> relax.Var:
+        x = self.env[node.args[0]]
+        dim = node.args[1]
+        start = node.args[2]
+        length = node.args[3]
+        return self.block_builder.emit(relax.op.strided_slice(x, [dim], [start], [length]))
 
     def _numel(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
@@ -581,19 +577,6 @@ class TorchFXImporter(BaseFXGraphImporter):
             x.struct_info.dtype in ["float16", "float32", "float64", "bfloat16"], "bool"
         )
 
-    def _to(self, node: fx.Node) -> relax.Var:
-        import torch
-
-        x = self.env[node.args[0]]
-        if len(node.args) == 2:
-            if isinstance(node.args[1], torch.dtype):
-                dtype = TorchFXImporter._convert_data_type(node.args[1], self.env)
-                return self.block_builder.emit(relax.op.astype(x, dtype))
-        elif "dtype" in node.kwargs:
-            dtype = TorchFXImporter._convert_data_type(node.kwargs["dtype"], self.env)
-            return self.block_builder.emit(relax.op.astype(x, dtype))
-        return x
-
     def _type(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
         dtype = TorchFXImporter._convert_data_type(node.args[1], self.env)
@@ -653,6 +636,7 @@ class TorchFXImporter(BaseFXGraphImporter):
             nn.SELU: self._unary_op(relax.op.nn.selu),
             nn.SiLU: self._unary_op(relax.op.nn.silu),
             nn.Softmax: self._softmax_module,
+            nn.Softplus: self._softplus_module,
             nn.Tanh: self._unary_op(relax.op.tanh),
             # neural network
             nn.AdaptiveAvgPool2d: self._adaptive_avg_pool2d_module,
@@ -717,6 +701,7 @@ class TorchFXImporter(BaseFXGraphImporter):
             "sin": self._unary_op(relax.op.sin),
             "sinh": self._unary_op(relax.op.sinh),
             "softmax": self._softmax,
+            "softplus": self._softplus,
             "sqrt": self._unary_op(relax.op.sqrt),
             "square": self._unary_op(relax.op.square),
             "tan": self._unary_op(relax.op.tan),
@@ -785,6 +770,8 @@ class TorchFXImporter(BaseFXGraphImporter):
             "argmin": self._argmax_argmin(relax.op.argmin),
             "where": self._where,
             # tensor manipulation
+            "argsort": self._argsort,
+            "broadcast_to": self._broadcast_to,
             "cat": self._cat,
             "chunk": self._chunk,
             "concat": self._cat,
@@ -796,6 +783,7 @@ class TorchFXImporter(BaseFXGraphImporter):
             "flatten": self._flatten,
             "flip": self._flip,
             "gather": self._gather,
+            "narrow": self._narrow,
             "numel": self._numel,
             "permute": self._permute,
             "repeat": self._repeat,
@@ -803,11 +791,13 @@ class TorchFXImporter(BaseFXGraphImporter):
             "scatter": self._scatter,
             "select": self._select,
             "size": self._size,
+            "sort": self._sort,
             "split": self._split,
             "squeeze": self._squeeze,
             "stack": self._stack,
             "take": self._take,
             "tile": self._tile,
+            "topk": self._topk,
             "transpose": self._transpose,
             "unsqueeze": lambda node: self.block_builder.emit(
                 relax.op.expand_dims(self.env[node.args[0]], node.args[1])
@@ -894,6 +884,18 @@ class TorchFXImporter(BaseFXGraphImporter):
         with self.block_builder.function(name=func_name, params=inputs.copy(), attrs=func_attrs):
             output = None
             with self.block_builder.dataflow():
+
+                # Find all the missing function types
+                missing_func_types = list(
+                    {
+                        node.target.__name__
+                        for node in graph.nodes
+                        if node.op == "call_function"
+                        and node.target.__name__ not in self.convert_map
+                    }
+                )
+                assert not missing_func_types, f"Unsupported function types {missing_func_types}"
+
                 # Translate model parameters.
                 for _, param in model.named_parameters():
                     shape = param.data.shape
@@ -939,9 +941,6 @@ class TorchFXImporter(BaseFXGraphImporter):
                         self.env[node] = self.convert_map[type(module)](node)
                     elif node.op == "call_function":
                         func_name = node.target.__name__
-                        assert (
-                            func_name in self.convert_map
-                        ), f"Unsupported function type {func_name}"
                         if func_name in custom_ops:
                             self.env[node] = self.convert_map[func_name](node, self)
                         else:
