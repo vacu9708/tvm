@@ -70,6 +70,24 @@ inline Tensor pool_grad_impl(const Tensor& out_grad, const Tensor& x,
   auto pad_bottom = padding_size[2];
   auto pad_right = padding_size[3];
 
+  arith::Analyzer analyzer;
+  auto out_height =
+      analyzer.Simplify((height - kernel_height + pad_top + pad_bottom) / stride_height + 1);
+  auto out_width =
+      analyzer.Simplify((width - kernel_width + pad_left + pad_right) / stride_width + 1);
+  /* guard against invalid upstream‐grad shapes */
+  // out_grad must have the same shape as the pooled-out shape.
+  ICHECK_EQ(GetConstInt(out_grad->shape[height_axis]), 
+            GetConstInt(out_height))
+      << "pool_grad: grad height ("
+      << out_grad->shape[height_axis] 
+      << ") does not match expected (" << out_height << ")";
+  ICHECK_EQ(GetConstInt(out_grad->shape[width_axis]), 
+            GetConstInt(out_width))
+      << "pool_grad: grad width ("
+      << out_grad->shape[width_axis] 
+      << ") does not match expected (" << out_width << ")";
+
   if (ceil_mode) {
     // Additional padding to ensure we do ceil instead of floor when
     // dividing by stride.
@@ -84,11 +102,6 @@ inline Tensor pool_grad_impl(const Tensor& out_grad, const Tensor& x,
   Array<PrimExpr> pad_after(std::vector<PrimExpr>(x->shape.size(), 0));
   pad_after.Set(height_axis, pad_bottom);
   pad_after.Set(width_axis, pad_right);
-  arith::Analyzer analyzer;
-  auto out_height =
-      analyzer.Simplify((height - kernel_height + pad_top + pad_bottom) / stride_height + 1);
-  auto out_width =
-      analyzer.Simplify((width - kernel_width + pad_left + pad_right) / stride_width + 1);
 
   auto dheight = tvm::te::reduce_axis(Range(0, kernel_height), "dh");
   auto dwidth = tvm::te::reduce_axis(Range(0, kernel_width), "dw");
